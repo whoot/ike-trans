@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # ike-trans.sh
 # 10/30/2015 by Ted R (https://github.com/actuated)
 # Adapted from original ike.sh script by Josh Stone
@@ -14,6 +15,7 @@
 # 1/1/2016 - Aesthetic change
 # 1/24/2016 - Added elif to check response for INVALID-ID-INFORMATION, --no-id-check to ignore
 # 12/12/2022 - Added audit parameter, IKEv2 support, bugfixes for aggressive mode and better progress spinning animation
+# 1/21/2026 - Fixed some edge cases and bugs and added some improvements
 
 varDateCreated="10/30/2015"
 varLastMod="12/12/2022"
@@ -22,7 +24,6 @@ varRunMode="null" # Varaible to set list or file targeting
 varIkeOpts="null" # Variable to give ike-scan options based on IKE mode
 varIkeName="admin" # Default group name for Aggressive Mode
 varTarget="null" # Variable for target host or input file
-varTest="" # Variable used to check input IPs and custom group name
 varAMAppend="" # Variable to add -Ppsk.txt to the end of example syntax for Aggressive Mode responses
 varOutFile="" # Variable for the name of the output file
 varCheckID="Y" # Variable to flag whether to check Aggressive Mode responses for INVALID-ID-INFORMATION and stop checking that host
@@ -73,36 +74,38 @@ function usage
   exit
 }
 
+i=0
 spin() {
-   local -a marks=( '┤' '┘' '┴' '└' '├' '┌' '┬' '┐' )
-   printf '%s\r' "${marks[i++ % ${#marks[@]}]}"
- }
+  local -a marks=( '┤' '┘' '┴' '└' '├' '┌' '┬' '┐' )
+  printf '%s\r' "${marks[i++ % ${#marks[@]}]}" >&2
+}
 
 # Function to perform IKE transforms scan for the provided host
 # Loop through possible transforms settings, displaying the transform, example ike-scan syntax, and response for each working transform
 function ike_trans
 {
-  echo "$1"
-  varCount=1
+  echo -e "\n[+] $1"
+  local varCount=1
   # Check Ikev1
   for ENC in $ENCLIST; do
     for HASH in $HASHLIST; do
       for AUTH in $AUTHLIST; do
         for GROUP in $GROUPLIST; do
-          RESPONSE=`ike-scan $varIkeOpts --multiline --trans=$ENC,$HASH,$AUTH,$GROUP $1`
+          RESPONSE=$(ike-scan "$varIkeOpts" --multiline --trans="$ENC","$HASH","$AUTH","$GROUP" "$1")
+          varFlagInvalidID=""
           varFlagReturned=$(echo "$RESPONSE" | grep -i 'handshake returned')
           if [ "$varCheckID" = "Y" ]; then varFlagInvalidID=$(echo "$RESPONSE" | grep -i 'invalid-id-information'); fi
           if [ "$varFlagReturned" != "" ]; then
-            echo -e "\033[2K"
-            echo "[$varCount] SYNTAX: ike-scan $varIkeOpts --trans=$ENC,$HASH,$AUTH,$GROUP $1 $varAMAppend"
+            printf '\r\033[2K' >&2
+            echo "[$varCount] SYNTAX: ike-scan "$varIkeOpts" --trans=$ENC,$HASH,$AUTH,$GROUP $1 $varAMAppend"
             echo "TRANSFORM: $ENC,$HASH,$AUTH,$GROUP"
             echo "$RESPONSE" | grep 'SA=' | awk '{print $1, $2, $3, $4, $5 }' | sed 's/SA=(//g'
-            let varCount=varCount+1
+            (( varCount++ )) || true
           elif [ "$varFlagInvalidID" != "" ]; then
-            echo -e "\033[2K"
+            printf '\r\033[2K' >&2
             echo "[*] INVALID-ID-INFORMATION:"
             echo "Find transforms with main mode and brute-force ID with ike-force"
-            echo -e "\033[2K"
+            printf '\r\033[2K' >&2
             return
           else
             spin
@@ -113,34 +116,33 @@ function ike_trans
   done
   # Check IKEv2
   for GROUP in 1 2 5 14 15 16 17 18; do
-    RESPONSE=`ike-scan -2 --multiline -g $GROUP $1`
+    RESPONSE=$(ike-scan -2 --multiline -g "$GROUP" "$1")
+    varFlagInvalidID=""
     varFlagReturned=$(echo "$RESPONSE" | grep -i 'handshake returned')
     if [ "$varFlagReturned" != "" ]; then
-          echo -e "\033[2K"
+          printf '\r\033[2K' >&2
+          echo
           echo "[$varCount] SYNTAX: ike-scan -2 -g $GROUP $1"
           echo "GROUP: $GROUP"
           echo "$RESPONSE" | grep 'SA=' | awk '{print $1, $2, $3, $4, $5 }' | sed 's/SA=(//g;s/)//g;s/Encr/Enc/;s/,/ /;s/DH_//'
-          let varCount=varCount+1
+          (( varCount++ )) || true
     else
       spin
     fi
   done
-  echo -e "\033[2K"
+  printf '\r\033[2K' >&2
 }
 
 # List-mode function to retrieve hosts from the list and call the ike_trans function for each
 function list_loop
 {
-  for varLine in `cat $varTarget`; do
-    varTest=$(echo $varLine | fgrep -o "." | wc -l)
-      if [ "$varTest" = "3" ]; then
-        echo
-        ike_trans $varLine
-      else
-        echo
-        echo "Error: '$varLine' in $varTarget does not appear to be an IP, skipping."
-      fi      
-  done
+  while IFS= read -r varLine || [ -n "$varLine" ]; do
+    if printf '%s\n' "$varLine" | grep -E -xq '([0-9]{1,3}\.){3}[0-9]{1,3}'; then
+        ike_trans "$varLine"
+    else
+      echo "[!] Error: '$varLine' in $varTarget does not appear to be an IP, skipping."
+    fi
+  done < "$varTarget"
 }
 
 # Display usage if no arguments are given
@@ -150,92 +152,83 @@ fi
 
 # Read options and paramaters
 while [ "$1" != "" ]; do
-  case $1 in
+  case "$1" in
 # Set list-mode operation, check to make sure file is given and exists, or error
     -f ) shift
-         varRunMode="list"
-         if [ "$1" != "" ]; then
-           if [ -f "$1" ]; then
-             varTarget=$1
-           else
-             echo
-             echo "Error: $1 does not exist as file for -f."
-             usage
-             exit
-           fi
-         else
-           echo
-           echo "Error: No file specified for -f."
-           usage
-           exit
-         fi
-         ;;
+        varRunMode="list"
+        if [ "$1" != "" ]; then
+          if [ -f "$1" ]; then
+            varTarget="$1"
+          else
+            echo
+            echo "Error: $1 does not exist as file for -f."
+            usage
+          fi
+        else
+          echo
+          echo "Error: No file specified for -f."
+          usage
+        fi
+        ;;
 # Set host-mode operation, check to make sure input is given and formatted as IP, or error
     -t ) shift
-         varRunMode="host"
-         if [ "$1" != "" ]; then
-           varTest=$(echo $1 | fgrep -o "." | wc -l)
-           if [ "$varTest" = "3" ]; then
-             varTarget=$1
-           else
-             echo
-             echo "Error: $1 does not appear to be a target host IP for -t."
-             usage
-             exit
-           fi
-         else
-           echo
-           echo "Error: No target host specified for -t."
-           usage
-           exit
-         fi
-         ;;
+        varRunMode="host"
+        if [ "$1" != "" ]; then
+          if printf '%s\n' "$1" | grep -E -xq '([0-9]{1,3}\.){3}[0-9]{1,3}'; then
+            varTarget="$1"
+          else
+            echo
+            echo "Error: $1 does not appear to be a target host IP for -t."
+            usage
+          fi
+        else
+          echo
+          echo "Error: No target host specified for -t."
+          usage
+        fi
+        ;;
 # Set Main Mode and IKE options
     -m ) varIkeMode="main"
-         ;;
+        ;;
 # Set Aggressive Mode and IKE options
     -a ) varIkeMode="aggr"
-         ;;
+        ;;
 # Set an alternative vpn group name for Aggressive Mode, or leave "admin" if no value is given
     -n ) shift
-         if [ "$1" != "" ]; then
-           varIkeName=$1
-         else
-           varIkeName="admin"
-         fi
-         ;;
+        if [ "$1" != "" ]; then
+          varIkeName="$1"
+        else
+          varIkeName="admin"
+        fi
+        ;;
 # Use all known transformations
-    --audit ) shift
-         ENCLIST="1 2 3 4 5 6 7/128 7/192 7/256 8" # Encryption algorithms: DES, IDEA, Blowfish, RC5, Triple-DES, CAST, AES/128, AES/192 and AES/256, Camellia
-         HASHLIST="1 2 3 4 5 6" # Hash algorithms: MD5, SHA1, Tiger, SHA2-256, SHA2-384, SHA2-512
-         AUTHLIST="1 2 3 4 5 6 7 8 64221 64222 64223 64224 65001 65002 65003 65004 65005 65006 65007 65008 65009 65010" # Authentication methods: Pre-Shared Key, RSA Signatures Hybrid Mode and XAUTH
-         GROUPLIST="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 31" # Diffie-Hellman groups
-         ;;
+    --audit )
+        ENCLIST="1 2 3 4 5 6 7/128 7/192 7/256 8" # Encryption algorithms: DES, IDEA, Blowfish, RC5, Triple-DES, CAST, AES/128, AES/192 and AES/256, Camellia
+        HASHLIST="1 2 3 4 5 6" # Hash algorithms: MD5, SHA1, Tiger, SHA2-256, SHA2-384, SHA2-512
+        AUTHLIST="1 2 3 4 5 6 7 8 64221 64222 64223 64224 65001 65002 65003 65004 65005 65006 65007 65008 65009 65010" # Authentication methods: Pre-Shared Key, RSA Signatures Hybrid Mode and XAUTH
+        GROUPLIST="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 31" # Diffie-Hellman groups
+        ;;
 # Set output file, error if input is not provided or output file already exists
     -o ) shift
-         if [ "$1" != "" ]; then
-           varOutFile=$1
-           if [ -f $varOutFile ]; then
-             echo
-             echo "Error: Output file already exists."
-             usage
-             exit
-           fi
-         else
-           echo
-           echo "Error: No output file specified for -o."
-           usage
-           exit
-         fi
-         ;;
+        if [ "$1" != "" ]; then
+          varOutFile="$1"
+          if [ -f "$varOutFile" ]; then
+            echo
+            echo "Error: Output file already exists."
+            exit
+          fi
+        else
+          echo
+          echo "Error: No output file specified for -o."
+          usage
+        fi
+        ;;
     --no-id-check ) varCheckID="N"
-         ;;
+        ;;
 # Display usage information if -h or an invalid option are given
     -h ) usage
-         exit
-         ;;
+        ;;
     * )  usage
-         exit 1
   esac
   shift
 done
@@ -252,7 +245,6 @@ elif [ "$varIkeMode" = "null" ]; then
   echo
   echo "Error: No Ike Mode (-a or -m) was set."
   usage
-  exit
 fi
 
 
@@ -261,7 +253,6 @@ if [ "$varRunMode" = "null" ]; then
   echo
   echo "Error: No Target (-t [host] or -f [file]) was set."
   usage
-  exit
 fi
 
 # Display interpreted parameters to the use before running
@@ -282,14 +273,20 @@ echo "=============================[ run ]============================="
 
 if [ "$varRunMode" = "host" ]; then
 # Call the ike_trans function directly if host-mode targeting is used
-  echo
-  ike_trans $varTarget | tee $varOutFile
+  if [ -n "$varOutFile" ]; then
+    ike_trans "$varTarget" | tee "$varOutFile"
+  else
+    ike_trans "$varTarget"
+  fi
 elif [ "$varRunMode" = "list" ]; then
 # Call the list_loop function if list-mode targeting is used
 # This lets all of the output be tee'd to output
-  list_loop | tee $varOutFile
+  if [ -n "$varOutFile" ]; then
+    list_loop | tee "$varOutFile"
+  else
+    list_loop
+  fi
 fi
 
 echo "=============================[ fin ]============================="
 echo
-
